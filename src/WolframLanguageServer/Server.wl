@@ -45,17 +45,28 @@ DeclareType[WorkState, <|
 	"openedDocs" -> _Association, (* (_DocumentUri -> _DocumentText)... *)
 	"client" -> (_SocketClient | _SocketObject | _NamedPipe | _StdioClient | "stdio" | Null),
 	"clientCapabilities" -> _Association,
+	"debugSession" -> _DebugSession,
 	"config" -> _Association,
 	"scheduledTasks" -> {___ServerTask}
-|>];
+|>]
+
+DeclareType[DebugSession, <|
+	"initialized" -> _?BooleanQ,
+	"server" -> _SocketObject | Null,
+	"client" -> _SocketObject | Null
+|>]
 
 InitialState = WorkState[<|
 	"initialized" -> False,
 	"openedDocs" -> <||>,
 	"client" -> Null,
+	"debugSession" -> DebugSession[<|
+		"server" -> Null,
+		"client" -> Null
+	|>],
 	"config" -> loadConfig[],
 	"scheduledTasks" -> {}
-|>];
+|>]
 
 ServerCapabilities = <|
 	"textDocumentSync" -> TextDocumentSyncKind["Full"],
@@ -68,12 +79,16 @@ ServerCapabilities = <|
 	"referencesProvider" -> True,
 	"documentSymbolProvider" -> True,
 	"documentHighlightProvider" -> True,
+	"codeLensProvider" -> <|
+		"resolveProvider" -> False
+	|>,
 	"colorProvider" -> True,
-	(* "executeCommandProvider" -> <|
+	"executeCommandProvider" -> <|
 		"commands" -> {
-			"openRef"
+			"dap-wl.run-file",
+			"dap-wl.run-range"
 		}
-	|>, *)
+	|>,
 	Nothing
 |>
 (*Place where the temporary img would be stored, delete after usage.*)
@@ -348,22 +363,35 @@ TcpSocketHandler[{stop_, state_WorkState}]:= (
 	CloseClient[state["client"]];
     {stop, state}
 )
-TcpSocketHandler[state_WorkState] := Module[
+TcpSocketHandler[state_WorkState] := With[
 	{
-		client = state["client"]
+		client = state["client"],
+		debugSession = state["debugSession"]
 	},
 
-	If[SocketReadyQ[client],
-		handleMessageList[ReadMessages[client], state]
-		// Replace[{
-			{"Continue", newstate_} :> newstate,
-			{stop_, newstate_} :> (
-				{stop, newstate}
-			),
-			{} :> state (* No message *)
-		}],
+	Which[
+		SocketReadyQ[client],
+		handleMessageList[ReadMessages[client], state],
+		(* new client connected *)
+		debugSession["server"] =!= Null &&
+		debugSession["client"] === Null &&
+		Length[debugSession["server"]["ConnectedClients"]] > 0,
+		{
+			"Continue",
+			ReplaceKey[state, {"debugSession", "client"} -> First[LogDebug@debugSession["server"]["ConnectedClients"]]]
+		},
+		debugSession["client"] =!= Null && SocketReadyQ[debugSession["client"]],
+		handleDapMessageList[ReadMessages[debugSession["client"]], state],
+		True,
 		doNextScheduledTask[state]
 	]
+	// Replace[{
+		{"Continue", newstate_} :> newstate,
+		{stop_, newstate_} :> (
+			{stop, newstate}
+		),
+		{} :> state (* No message *)
+	}]
 ] // TcpSocketHandler (* Put the recursive call out of the module to turn on the tail-recursion optimization *)
 
 
@@ -648,11 +676,12 @@ CloseClient[client_NamedPipe] := With[
 (*Handle Message*)
 
 
-NotificationQ[msg_Association] := MissingQ[msg["id"]];
+NotificationQ := KeyExistsQ["id"] /* Not
+(* NotificationQ[msg_Association] := MissingQ[msg["id"]] *)
 
 handleMessageList[msgs:{___Association}, state_WorkState] := (
     FoldWhile[handleMessage[#2, Last[#1]]&, {"Continue", state}, msgs, MatchQ[{"Continue", _}]]
-);
+)
 
 handleMessage[msg_Association, state_WorkState] := Module[
 	{
@@ -688,7 +717,57 @@ handleMessage[msg_Association, state_WorkState] := Module[
 		True,
 		handleRequest[method, msg, newState]
 	]
-];
+]
+
+
+handleDapMessageList[msgs:{___Association}, state_WorkState] := (
+    FoldWhile[handleDapMessage[#2, Last[#1]]&, {"Continue", state}, msgs, MatchQ[{"Continue", _}]]
+)
+
+handleDapMessage[msg_Association, state_WorkState] := Module[
+	{
+		newState = state
+	},
+
+	Replace[msg["type"], {
+		"request" :> (
+			LogDebug @ Iconize[msg["command"], msg["arguments"]]
+		),
+		"event" :> (
+			LogDebug @ Iconize[msg["event"], msg["body"]]
+		),
+		"respond" :> (
+			LogDebug @ Iconize[msg["command"], msg["body"], msg["message"]]
+		)
+	}];
+
+	Which[
+		(* wrong message before initialization *)
+		!state["debuggerInitialized"] &&
+		msg["type"] != "request" &&
+		!MemberQ[{"initialize"}, msg["command"]],
+		If[msg["type"] == "request",
+			sendResponse[state["dubugSession"]["client"], <|
+				"type" -> "response",
+				"request_seq" -> msg["seq"],
+				"success" -> False,
+				"command" -> msg["command"],
+				"message" -> "ServerNotInitialized",
+				"body" -> <|
+					"error" -> "The server is not initialized."
+				|>
+			|>]
+			(* otherwise, dropped the notification *)
+		];
+		{"Continue", state},
+		(* notification*)
+		msg["event"],
+		handleDapEvent[msg["event"], msg, newState],
+		(* resquest *)
+		True,
+		handleDapRequest[msg["command"], msg, newState]
+	]
+]
 
 
 (* ::Subsection:: *)
@@ -712,27 +791,24 @@ sendResponse[client_, res_Association] := (
 (*initialize*)
 
 
-handleRequest["initialize", msg_, state_WorkState] := Module[
-	{
-		newState = state
-	},
+handleRequest["initialize", msg_, state_WorkState] := (
 
-	LogDebug["handle/initialize"];
-	
-	(* Check Client Capabilities *)
-	newState = ReplaceKey[state,
-		"clientCapabilities" -> msg["params"]["capabilities"]
-	];
-	
 	sendResponse[state["client"], <|
 		"id" -> msg["id"],
 		"result" -> <|
 			"capabilities" -> ServerCapabilities
 		|>
 	|>];
-	
-	{"Continue", newState}
-];
+
+	(* TODO(kenkangxgwe): check client capabilities *)
+	{
+		"Continue",
+		Fold[ReplaceKey, state, {
+				"clientCapabilities" -> msg["params"]["capabilities"]
+				(* {"debugSession", "server"} -> SocketOpen[8216] *)
+		}]
+	}
+)
 
 
 (* ::Subsection:: *)
@@ -751,6 +827,32 @@ handleRequest["shutdown", msg_, state_] := Module[
 	
 	{"Continue", state}
 ];
+
+
+(* ::Subsection:: *)
+(*workspace/executeCommand*)
+
+
+handleRequest["workspace/executeCommand", msg_, state_] := With[
+	{
+		command = msg["params"]["command"],
+		args = msg["params"]["arguments"]
+	},
+
+	Replace[command, {
+		"dap-wl.runfile" -> (
+			LogInfo[StringJoin["executing ", command, "with arguments: ", ToString[args]]]
+		)
+	}];
+
+	sendResponse[state["client"], <|
+		"id" -> msg["id"],
+		"result" -> Null
+	|>];
+
+	{"Continue", state}
+
+]
 
 
 (* ::Subsection:: *)
@@ -983,6 +1085,103 @@ handleRequest["textDocument/documentSymbol", msg_, state_] := With[
 	// List
 	// Prepend["Continue"]
 ]
+
+
+(* ::Subsection:: *)
+(*textDocuent/codeLens*)
+
+
+handleRequest["textDocument/codeLens", msg_, state_] := With[
+	{
+		id = msg["id"],
+		uri = msg["params"]["textDocument"]["uri"]
+	},
+
+	sendResponse[state["client"], <|
+		"id" -> id,
+		"result" -> (
+			{
+				If[state["debugSession"]["initialized"],
+					{
+						CodeLens[<|
+							"range" -> <|
+								"start" -> <|
+									"line" -> 0,
+									"character" -> 0
+								|>,
+								"end" -> <|
+									"line" -> 0,
+									"character" -> 0
+								|>
+							|>,
+							"command" -> <|
+								"title" -> "$(workflow) Evaluate File",
+								"command" -> "dap-wl.run-file",
+								"arguments" -> {<|
+									"uri" -> uri
+								|>}
+							|>
+						|>],
+						Table[
+							CodeLens[<|
+								(* range can only span one line *)
+								"range" -> (
+									codeRange
+									// ReplaceKey["end" -> codeRange["start"]]
+									(* // ReplaceKey[{"end", "line"} -> codeRange["start"]["line"]]
+									// ReplaceKey[{"end", "character"} -> 1] *)
+								),
+								"command" -> <|
+									"title" -> "$(play) Evaluate",
+									"command" -> "dap-wl.run-range",
+									"arguments" -> {<|
+										"uri" -> uri,
+										"range" -> codeRange
+									|>}
+								|>
+							|>],
+							{
+								codeRange,
+								state["openedDocs"][uri]
+								// FindAllCodeRanges
+							}
+						]
+					},
+					Nothing
+				]
+			}
+			// Flatten
+			// ToAssociation
+		)
+	|>];
+
+	{"Continue", state}
+
+]
+
+
+(* ::Subsection:: *)
+(*codeLens/resolve*)
+
+
+handleRequest["codeLens/resolve", msg_, state_] := With[
+	{
+		id = msg["id"],
+		codeLens = msg["params"]
+	},
+
+	sendResponse[state["client"], <|
+		"id" -> id,
+		"result" -> ToAssociation[
+			ConstructType[codeLens, CodeLens]
+			// ReplaceKeyBy[{"command", "title"} -> (StringJoin[#1, " ", ToString[codeLens["data"]]]&)]
+			// ReplaceKeyBy["data" -> ((# + 1)&)]
+			]
+	|>];
+
+	{"Continue", state}
+]
+
 
 
 (* ::Subsection:: *)
@@ -1319,6 +1518,29 @@ handleNotification[_, msg_, state_] := (
 
 
 (* ::Section:: *)
+(*Handle Dap Request*)
+
+
+handleDapRequest["initialize", msg_, state_WorkState] := (
+	sendResponse[state["debugSession"]["client"], <|
+		"type" -> "response",
+		"request_seq" -> msg["request_seq"],
+		"success" -> True,
+		"command" -> msg["command"],
+		"body" -> <|
+			Nothing
+		|>
+	|>];
+
+	{
+		"Continue",
+		state
+		// ReplaceKey[{"debugSession", "initialized"} -> True]
+	}
+)
+
+
+(* ::Section:: *)
 (*Send Message*)
 
 
@@ -1421,7 +1643,7 @@ doNextScheduledTask[state_WorkState] := (
 	// Replace[{
 		_?MissingQ :> (
 			Pause[0.001];
-			state
+			{"Continue", state}
 		),
 		task_ServerTask :> Block[
 			{
@@ -1502,7 +1724,7 @@ doNextScheduledTask[state_WorkState] := (
 					}]
 				)
 			}];
-			newState
+			{"Continue", newState}
 		]
 	}]
 )

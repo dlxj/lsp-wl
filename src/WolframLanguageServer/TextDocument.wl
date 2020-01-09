@@ -21,6 +21,7 @@ ToDocumentSymbol::usage = "ToDocumentSymbol[doc_TextDocument] gives the Document
 FindDefinitions::usage = "FindDefinitions[doc_TextDocument, pos_LspPosition] gives the definitions of the symbol at the position in the Top level."
 FindReferences::usage = "FindReferences[doc_TextDocument, pos_LspPosition, o:OptionsPattern[]] gives the references of the symbol at the position."
 FindDocumentHighlight::usage = "FindDocumentHighlight[doc_TextDocument, pos_LspPosition] gives a list of DocumentHighlight."
+FindAllCodeRanges::usage = "FindAllCodeRanges[doc_TextDocument] returns a list of LspRange which locate all the code ranges (cells) in the given doc."
 FindDocumentColor::usage = "FindDocumentColor[doc_TextDocument] gives a list of colors in the text document."
 GetColorPresentation::usage = "GetColorPresentation[doc_TextDocument, color_LspColor, range_LspRange] gives the RGBColor presentation of the color."
 
@@ -344,6 +345,18 @@ GetCodeRangeAtPosition[doc_TextDocument, pos_LspPosition] := With[
     ]
     // SelectFirst[Curry[Between, 2][line]]
 ]
+
+
+FindAllCodeRanges[doc_TextDocument] := (
+
+    Cases[
+        divideCells[doc],
+        node_CellNode :> node["codeRange"],
+        {0, Infinity}
+    ]
+    // Catenate
+    // Map[Curry[ToLspRange, 2][doc]]
+)
 
 
 (* ::Section:: *)

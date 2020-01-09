@@ -25,6 +25,8 @@ DiagnosticRelatedInformation::usage = "is the type of DiagnosticRelatedInformati
 CompletionItem::usage = "is the type of CompletionItem interface in LSP."
 Location::usage = "is the type of Location interface in LSP."
 DocumentHighlight ::usage = "is the type of Location interface in LSP."
+Command::usage = "is type of Command Interface in LSP."
+CodeLens::usage = "is type of CodeLens Interface in LSP."
 ColorInformation::usage = "is the type of ColorInformation interface in LSP."
 LspColor::usage = "is the type of Color interface in LSP."
 ColorPresentation::usage = "is the type of ColorPresentation interface in LSP."
@@ -249,20 +251,31 @@ DeclareType[CompletionItem, <|
     "commitCharacters" -> {___String}
 |>]
 
-
 DeclareType[Location, <|
     "uri" -> DocumentUri,
-    "range" -> LspRange
+    "range" -> _LspRange
 |>]
 
 DeclareType[DocumentHighlight, <|
-    "range" -> LspRange,
+    "range" -> _LspRange,
     "kind" -> _Integer
 |>]
 
+DeclareType[Command, <|
+    "title" -> _String,
+    "command" -> _String,
+    "arguments" -> _List
+|>]
+
+DeclareType[CodeLens, <|
+    "range" -> _LspRange,
+    "command" -> _Command,
+    "data" -> _
+|>]
+
 DeclareType[ColorInformation, <|
-    "range" -> LspRange,
-    "color" -> LspColor
+    "range" -> _LspRange,
+    "color" -> _LspColor
 |>]
 
 DeclareType[LspColor, <|
